@@ -2,9 +2,7 @@
 # Licensed under the MIT License.
 # This file is part of AnonXMusic
 
-
 import asyncio
-
 from pyrogram import enums, errors, types
 
 from anony import app, config, db, logger, queue, yt
@@ -13,10 +11,12 @@ from anony.helpers import utils
 
 def checkUB(play):
     async def wrapper(_, m: types.Message):
+
         if not m.from_user:
             return await m.reply_text(m.lang["play_user_invalid"])
 
         chat_id = m.chat.id
+
         if m.chat.type != enums.ChatType.SUPERGROUP:
             await m.reply_text(m.lang["play_chat_invalid"])
             return await app.leave_chat(chat_id)
@@ -27,39 +27,75 @@ def checkUB(play):
             return await m.reply_text(m.lang["play_usage"])
 
         if len(queue.get_queue(chat_id)) >= config.QUEUE_LIMIT:
-            return await m.reply_text(m.lang["play_queue_full"].format(config.QUEUE_LIMIT))
+            return await m.reply_text(
+                m.lang["play_queue_full"].format(config.QUEUE_LIMIT)
+            )
 
         force = m.command[0].endswith("force") or (
             len(m.command) > 1 and "-f" in m.command[1]
         )
+
         video = m.command[0][0] == "v" and config.VIDEO_PLAY
+
         url = utils.get_url(m)
+
         if url and yt.invalid(url):
-            return await m.reply_text(m.lang["play_not_found"].format(config.SUPPORT_CHAT))
+            return await m.reply_text(
+                m.lang["play_not_found"].format(config.SUPPORT_CHAT)
+            )
+
         m3u8 = url and not yt.valid(url)
 
+        # ===============================
+        # STREAM INTEGRATION FIX
+        # ===============================
+        video_id = None
+
+        if url and yt.valid(url):
+            try:
+                video_id = url.split("v=")[-1].split("&")[0]
+            except Exception:
+                video_id = None
+
+        if video_id and not m3u8:
+            stream_url = await yt.stream(video_id)
+
+            if stream_url:
+                url = stream_url
+                logger.info("Using STREAM instead of download")
+            else:
+                logger.warning("Stream failed, fallback to download")
+
+        # ===============================
+        # ADMIN CHECK
+        # ===============================
         play_mode = await db.get_play_mode(chat_id)
+
         if play_mode or force:
             adminlist = await db.get_admins(chat_id)
+
             if (
                 m.from_user.id not in adminlist
                 and not await db.is_auth(chat_id, m.from_user.id)
-                and not m.from_user.id in app.sudoers
+                and m.from_user.id not in app.sudoers
             ):
                 return await m.reply_text(m.lang["play_admin"])
 
+        # ===============================
+        # VC HANDLING
+        # ===============================
         if chat_id not in db.active_calls:
             client = await db.get_client(chat_id)
+
             try:
                 member = await app.get_chat_member(chat_id, client.id)
+
                 if member.status in [
                     enums.ChatMemberStatus.BANNED,
                     enums.ChatMemberStatus.RESTRICTED,
                 ]:
                     try:
-                        await app.unban_chat_member(
-                            chat_id=chat_id, user_id=client.id
-                        )
+                        await app.unban_chat_member(chat_id, client.id)
                     except Exception:
                         return await m.reply_text(
                             m.lang["play_banned"].format(
@@ -69,15 +105,13 @@ def checkUB(play):
                                 f"@{client.username}" if client.username else None,
                             )
                         )
+
             except errors.ChatAdminRequired:
                 return await m.reply_text(m.lang["admin_required"])
+
             except (errors.UserNotParticipant, errors.exceptions.bad_request_400.UserNotParticipant):
                 if m.chat.username:
                     invite_link = m.chat.username
-                    try:
-                        await client.resolve_peer(invite_link)
-                    except Exception:
-                        pass
                 else:
                     try:
                         invite_link = (await app.get_chat(chat_id)).invite_link
@@ -90,8 +124,9 @@ def checkUB(play):
                             m.lang["play_invite_error"].format(type(ex).__name__)
                         )
 
-                umm = await m.reply_text(m.lang["play_invite"].format(app.name))
+                msg = await m.reply_text(m.lang["play_invite"].format(app.name))
                 await asyncio.sleep(2)
+
                 try:
                     await client.join_chat(invite_link)
                 except errors.UserAlreadyParticipant:
@@ -100,27 +135,29 @@ def checkUB(play):
                     await asyncio.sleep(2)
                     try:
                         await app.approve_chat_join_request(chat_id, client.id)
-                    except errors.HideRequesterMissing:
+                    except Exception:
                         pass
-                    except Exception as ex:
-                        return await umm.edit_text(
-                            m.lang["play_invite_error"].format(type(ex).__name__)
-                        )
                 except Exception as ex:
-                    logger.error(f"Error joining chat - {chat_id}: {ex}")
-                    return await umm.edit_text(
+                    logger.error(f"Join error {chat_id}: {ex}")
+                    return await msg.edit_text(
                         m.lang["play_invite_error"].format(type(ex).__name__)
                     )
 
-                await umm.delete()
+                await msg.delete()
                 await client.resolve_peer(chat_id)
 
+        # ===============================
+        # DELETE COMMAND IF ENABLED
+        # ===============================
         if await db.get_cmd_delete(chat_id):
             try:
                 await m.delete()
             except Exception:
                 pass
 
+        # ===============================
+        # FINAL CALL
+        # ===============================
         return await play(_, m, force, m3u8, video, url)
 
     return wrapper
